@@ -1,0 +1,62 @@
+# 开发说明
+
+面向修改本插件的人。安装与使用见 [README.md](README.md)。
+
+## 目录结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `lib/index.js` | 宿主侧：注册 `present_document` 工具，并在 `127.0.0.1:17771` 起只读回环服务（`GET /latest?session=<会话 id>`） |
+| `lib/client.js` | 浏览器侧：右栏标签页 `dsh-present-document`，轮询宿主并渲染 Markdown |
+| `cordis.patch.yml` | 作为 bundle 的补丁层，把插件行插入 Web 插件名册（一行同时挂宿主侧与浏览器侧） |
+| `package.json` | `dsh.bundle.patch` / `dsh.client` / `dsh.engines` 等装载声明 |
+
+## 机制与约束
+
+- 文档按**调用方会话**分桶：宿主从 `exec.agent.session.id` 取会话 id 当桶键，每个会话只保留自己那份。
+- 回环接口：`GET /latest?session=<会话 id>` 返回该会话最近一份文档 `{ title, markdown, at }`（该会话还没有文档时是 `{ title: '', markdown: '', at: 0 }`）；`GET /latest`（不带参数）返回全局最新一份，只给自检用。
+- 浏览器侧每 2500ms 轮询（页面不可见时不轮询），带上当前查看的会话 id（`ctx.uiSession.adapter.current` 的 `key`）；取不到会话 id 就跳过本轮——宁可不推，也不把文档串到别的会话。切换会话时立刻补一次轮询。
+- `at` 是跨会话共用的单调时间戳；某会话的文档 `at` 比它上次推过的更新时，才在**该会话**的右栏自动打开标签页，所以别的会话推来的文档不会弹到用户正在看的会话里。
+- 取不到会话 id 的调用（`exec.agent` 缺失）落空键，谁都读不到，只有不带参数的 `/latest` 能看到——这是唯一的降级路径。
+- 端口被占用时：宿主侧记一条错误、`present_document` 返回 `delivered: false`；右栏不会显示任何内容（面板只渲染轮询到的结果），需先释放端口再重新调用。
+- 插件被禁用 / 移除时关闭该服务并释放端口，不留后台监听。
+- 文档只存在宿主内存，**不落盘**；桌面端重启后需要重新调用一次。
+- 渲染口径（`lib/client.js` 的 `renderMarkdown`）：有序列表按**作者写的序号**渲染（`<ol start>` + `<li value>`），所以「严重 1–3 → 待定 4–6」这类跨段连续编号不会被重排成 1、2、3；同一项下缩进 2 空格以上的续行（问题 / 拟改动 / 判定依据…）作为该项正文另起一行，不占新序号；比首项更深一层的子列表也按续行文本处理（`· ` 前缀），不参与顶层编号。
+- 每个会话只保留**最近一份**文档；最多同时保留 24 个会话的文档，超出按最久未呈交淘汰。
+- 宿主侧只绑 `127.0.0.1`，且只对本机自身的页面源回显 CORS 头：回环 http 源（`127.0.0.1` / `localhost` / `[::1]`，浏览器里打开的 Web GUI）与桌面端的 `dsh-app:` 协议源（桌面窗口的页面源是 `dsh-app://app`）；其它网页读不到。本机其它进程仍可直接访问该端口（无鉴权，内容是文档正文，不含凭证）。
+
+## 命名口径
+
+| 名字 | 用在哪 |
+| --- | --- |
+| `dsh-present-document` | npm 包名 / bundle 名 / 浏览器模块 id / 插件行 id（entryId `include:dsh-present-document`）/ 标签页 id 与 kind / 日志前缀 |
+| `present_document` | 模型工具名；工具注册表用下划线，属独立命名空间，不带前缀 |
+
+## 生效方式
+
+- `lib/client.js` 改动需重启桌面端：Web 插件名册在启动时扫描生成。
+- `cordis.patch.yml` / `package.json` 里的装载声明改动同样需要重启。
+- 禁用 / 移除插件时宿主侧会关闭回环服务并释放 17771 端口。
+
+## 装载踩坑（实测记录）
+
+1. 工具的 `output` 必须同时有 `schema` 与 `render(args, value)`，缺一个就报 `must declare output { schema, render, presentationMeta? }`。
+2. `output.schema` 是标准 JSON Schema：**属性里不能写 `required: true`**，要用对象级 `required: [...]`；而工具的 `parameters` 用的是逐属性 `required: true` 的方言，两者不一样。
+
+## 兼容性
+
+- `dsh.engines.dsh` 声明为 `>=0.2.2-rc.2`（按 0.2.2-rc.5 实测）。
+- 客户端用到的宿主面：`ctx.sidebarRightTabs.register`、`ctx.slots.inject` + `ctx.slots.register`、`ctx.sidebarRight.openTab`、`ctx.effect`，以及 `ctx.uiSession.adapter.current` 的 `getSnapshot().key` 与 `subscribe`。前四个是公开面；`uiSession.adapter.current` 是唯一需要留意的半私有面——宿主调整会话状态结构时会先破这一处。
+
+## 版本管理
+
+- 语义化版本写在 `package.json` 的 `version`；发版打 tag（`v0.1.0`），安装端可用 `#v0.1.0` 锁定。
+- 本仓库**无构建步骤**：`lib/` 里的 JS 就是发布内容，提交即可安装。
+- `package.json` 的 `files` 白名单决定装进安装端的内容（`lib/`、`cordis.patch.yml`、`README.md`、`dev.md`、`LICENSE`），新增文件记得加进去。
+
+## 改动前自检
+
+- 宿主侧：`http://127.0.0.1:17771/latest?session=<会话 id>` 返回 `{ title, markdown, at }` 形态的 JSON；换一个没呈交过的会话 id 应返回空文档（`at: 0`）；每调用一次 `present_document`，该会话的 `at` 必须变大（只看“能返回 JSON”不够，旧实例也能返回）。
+- 自测不想和正在运行的实例抢 17771 时，可用环境变量 `DSH_PRESENT_DOCUMENT_PORT` 把宿主侧起在空闲端口；浏览器侧固定 17771，正式环境别设。
+- 释放：禁用插件后 `Test-NetConnection 127.0.0.1 -Port 17771` 应失败、端口不再监听。
+- 浏览器侧：在会话 A 调用后，只有会话 A 的右栏自动打开；切到会话 B 不应看到这份文档，在会话 B 调用则只出现在 B，再次调用覆盖同一标签页而不是新建。

@@ -1,0 +1,6 @@
+node_modules/
+.verify/
+*.log
+*.tgz
+.DS_Store
+StartVSCode.bat
